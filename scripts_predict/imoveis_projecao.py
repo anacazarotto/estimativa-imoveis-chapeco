@@ -29,6 +29,7 @@ import argparse
 import json
 import sqlite3
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +40,7 @@ from imoveis_ml_hibrido import load_artifact as load_price_artifact
 from imoveis_ml_hibrido import predict_price
 from imoveis_valorizacao import ALLOWED_TYPES, MAX_ABS_MONTHLY_LOG_CHANGE, load_panel
 from ipca import faixa_anual, load_ipca
+from indice_ipca_incc import resumo as resumo_ipca_incc
 from ivgr import load_ivgr
 from model_io import load_model, save_model
 
@@ -59,7 +61,8 @@ MAX_ANOS = 30
 REFERENCIAS = ("ipca-media", "ipca-12m", "nenhuma")
 # v2: força do índice de referência como ponto de partida, em "meses de dados equivalentes".
 PRIOR_MESES = 12
-VERSOES_V2 = {"v2-ivgr": "ivgr", "v2": "ipca"}  # versão -> índice de referência
+# versão -> índice de referência (v3: IPCA+INCC, `indice_ipca_incc.py`)
+VERSOES_INDICE = {"v3": "ipca_incc", "v2-ivgr": "ivgr", "v2": "ipca"}
 
 
 # --------------------------------------------------------------------- taxas
@@ -163,12 +166,22 @@ def meses_observados(artifact):
     return max(1, (max(meses) - min(meses)).n)
 
 
-def resumo_referencia(artifact, base):
-    """Resumo do índice usado como ponto de partida da v2: "ivgr" (imóveis) ou "ipca"."""
+@lru_cache(maxsize=None)
+def _resumo_indice(base):
+    """Resumo de um índice a partir da cópia local (lida uma vez por processo)."""
+    if base == "ipca_incc":
+        return resumo_ipca_incc()
     if base == "ivgr":
         return load_ivgr(atualizar=False)
+    return {"faixa_12m_pct": faixa_anual()}  # ipca: a média vem do artefato
+
+
+def resumo_referencia(artifact, base):
+    """Índice de partida: "ipca_incc" (v3), "ivgr" (imóveis) ou "ipca"."""
+    if base in ("ipca_incc", "ivgr"):
+        return _resumo_indice(base)
     ipca = artifact.get("ipca")
-    return {**ipca, "faixa_12m_pct": faixa_anual()} if ipca else None
+    return {**ipca, **_resumo_indice("ipca")} if ipca else None
 
 
 def ajustar_referencia(rate, artifact, base="ivgr", prior_meses=PRIOR_MESES):
@@ -221,13 +234,17 @@ def project(
     preco_atual=None,
     taxa_referencia=None,
     versao="v1",
+    valor_estimado=None,
 ):
     """Valor estimado hoje e ano a ano. Função pensada para ser usada pela interface.
 
     `preco_atual` (opcional) substitui o valor estimado pelo modelo de preço.
     `taxa_referencia` (opcional, % ao ano) adiciona um cenário de referência (IPCA).
-    `versao`: "v1" usa só a taxa medida nos anúncios; "v2-ivgr" a combina com o IVG-R
-    (índice de imóveis do BCB) e "v2" com o IPCA (`ajustar_referencia`).
+    `versao`: "v1" usa só a taxa medida nos anúncios; "v3" a combina com o índice
+    IPCA+INCC, "v2-ivgr" com o IVG-R (índice de imóveis do BCB) e "v2" com o IPCA
+    (`ajustar_referencia`).
+    `valor_estimado` (opcional): valor de hoje já calculado por outro modelo (ex.: o
+    modelo de preço v3); nesse caso `price_artifact` só fornece o erro típico.
     """
     bairro = unify_bairro(bairro)
     tipo = canonical_tipo(tipo_imovel)
@@ -237,21 +254,24 @@ def project(
     if not 1 <= anos <= MAX_ANOS:
         raise ValueError(f"Horizonte deve estar entre 1 e {MAX_ANOS} anos.")
 
-    valor_modelo = predict_price(
-        price_artifact,
-        area_total=area_total,
-        area_privada=area_privada,
-        bairro=bairro,
-        tipo_imovel=tipo,
-        quartos=quartos,
-        banheiros=banheiros,
-        vagas=vagas,
-    )
+    if valor_estimado is not None:
+        valor_modelo = float(valor_estimado)
+    else:
+        valor_modelo = predict_price(
+            price_artifact,
+            area_total=area_total,
+            area_privada=area_privada,
+            bairro=bairro,
+            tipo_imovel=tipo,
+            quartos=quartos,
+            banheiros=banheiros,
+            vagas=vagas,
+        )
     valor_hoje = float(preco_atual) if preco_atual else float(valor_modelo)
     rate, origem = lookup_rate(artifact, bairro, tipo)
     peso_dados = 1.0
-    if versao in VERSOES_V2:
-        rate, peso = ajustar_referencia(rate, artifact, base=VERSOES_V2[versao])
+    if versao in VERSOES_INDICE:
+        rate, peso = ajustar_referencia(rate, artifact, base=VERSOES_INDICE[versao])
         if peso is not None:
             peso_dados = peso
 
@@ -281,7 +301,7 @@ def project(
         "taxa_anual_otimista_pct": annual_pct(rate["mensal_alta"]),
         "taxa_referencia_pct": taxa_referencia,
         "versao": versao,
-        "peso_dados": peso_dados,  # v2: peso da taxa medida (o resto é IPCA)
+        "peso_dados": peso_dados,  # v2/v3: peso da taxa medida (o resto é o índice)
         "dados_ate": artifact["ultimo_mes"],
         "projecao": pd.DataFrame(rows),
     }
@@ -549,11 +569,11 @@ def build_parser():
     )
     p.add_argument(
         "--versao",
-        choices=("v1", "v2-ivgr", "v2"),
+        choices=("v1", "v3", "v2-ivgr", "v2"),
         default="v1",
         help=(
-            "v1: taxa medida nos anúncios; v2-ivgr: combinada com o IVG-R (índice de "
-            "imóveis do BCB); v2: combinada com o IPCA."
+            "v1: taxa medida nos anúncios; v3: combinada com o índice IPCA+INCC; v2-ivgr: "
+            "combinada com o IVG-R (índice de imóveis do BCB); v2: combinada com o IPCA."
         ),
     )
     p.set_defaults(func=cmd_predict)

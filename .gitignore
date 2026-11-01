@@ -43,6 +43,10 @@ modelos/*
 !modelos/preco_imovel_modelo_hibrido_rapido.pkl.sig
 !modelos/projecao_modelo.pkl
 !modelos/projecao_modelo.pkl.sig
+!modelos/preco_imovel_modelo_v3.pkl
+!modelos/preco_imovel_modelo_v3.pkl.sig
+# Estimadores do modelo v3 (um arquivo comprimido por estimador, todos abaixo de 25 MB)
+!modelos/v3/
 catboost_info/
 
 # Logs and temp files
@@ -54,3 +58,6 @@ catboost_info/
 .env
 .env.*
 !.env.example
+
+# Pacote do artigo para subir no Overleaf (gerado a partir de artigo_tcc/)
+artigo_tcc/*.zip

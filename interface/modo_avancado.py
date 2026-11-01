@@ -1,8 +1,10 @@
-"""Modo avançado da interface: todos os modelos candidatos e o dataset de treino.
+"""Abas "Modelos" e "Dataset" da interface (versão 3).
 
-Lê dois arquivos gerados por `scripts_predict/resultados_modelos.py`:
-- `dados/resultados_modelos.json`: métricas e previsões no teste de cada candidato;
-- `dados/dataset_imoveis.csv`: casas e apartamentos usados no treino.
+Lê:
+- `dados/resultados_modelos_v3.json` (`scripts_predict/resultados_v3.py`): métricas e
+  previsões no teste de todos os candidatos treinados no protocolo da v3;
+- `dados/dataset_simulado_v3.csv` (`scripts_predict/modelo_v3.py`): o dataset usado no
+  treino, com os anúncios reais e o histórico simulado.
 """
 
 import json
@@ -12,11 +14,12 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from modelos_info import ALVOS, info
+from modelos_info import ALVOS, POR_QUE_GERAL, info
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RESULTADOS_JSON = PROJECT_ROOT / "dados" / "resultados_modelos.json"
+RESULTADOS_JSON = PROJECT_ROOT / "dados" / "resultados_modelos_v3.json"
 DATASET_CSV = PROJECT_ROOT / "dados" / "dataset_imoveis.csv"
+DATASET_V3_CSV = PROJECT_ROOT / "dados" / "dataset_simulado_v3.csv"
 TIPOS = ("Apartamento", "Casa")
 
 COR_DESTAQUE = "#2a78d6"
@@ -41,16 +44,49 @@ def carregar_resultados():
 
 
 @st.cache_data(show_spinner=False)
-def carregar_dataset():
+def carregar_dataset(com_simulados=False):
+    """Base real; com `com_simulados`, a base v3 (reais + histórico simulado IPCA+INCC)."""
+    if com_simulados:
+        if not DATASET_V3_CSV.exists():
+            return None
+        df = pd.read_csv(DATASET_V3_CSV)
+        area = df["area_privada"].where(df["area_privada"] > 0, df["area_total"])
+        df["preco_m2"] = (df["preco"] / area.where(area > 0)).round(0)
+        df["origem"] = df["simulado"].map({0: "real", 1: "simulado"})
+        colunas = ["imovel", "origem", "mes", "tipo_imovel", "bairro", "area_total", "area_privada",
+                   "quartos", "banheiros", "vagas", "preco", "preco_m2", "mes_anuncio", "preco_anunciado"]
+        return df[colunas]
     if not DATASET_CSV.exists():
         return None
     return pd.read_csv(DATASET_CSV)
 
 
 def rotulo_modelo(m):
+    marca = "★ " if m.get("escolhido") else ""
     if m["modelo"] == "Ensemble":
-        return "Ensemble (o modelo usado no site)"
-    return f"{m['modelo']} — alvo {m['alvo']} · {m['posicao_cv']}º na validação cruzada"
+        return f"{marca}{m['posicao_cv']}º · Ensemble (3 melhores que rodam no site)"
+    return f"{marca}{m['posicao_cv']}º · {m['modelo']} — alvo {m['alvo']}"
+
+
+def nome_curto(m):
+    return f"{m['modelo']} ({'3 melhores' if m['modelo'] == 'Ensemble' else m['alvo']})"
+
+
+def por_que_resultado(seg, modelo, dados):
+    """Texto do resultado do modelo: posição no critério (MdAPE), distância para o melhor e o porquê."""
+    candidatos = seg["modelos"]
+    melhor = candidatos[0]  # já ordenados pelo critério
+    dif = modelo["cv"]["mdape"] - melhor["cv"]["mdape"]
+    posicao = (
+        f"Ficou em **{modelo['posicao_cv']}º de {len(candidatos)}** na validação cruzada pelo erro "
+        f"percentual mediano (MdAPE {num(modelo['cv']['mdape'])}%)"
+        + (" (o melhor)." if modelo is melhor else f", {num(dif)} ponto(s) percentual(is) acima do melhor ({nome_curto(melhor)}).")
+    )
+    if modelo.get("escolhido"):
+        posicao += " **É o modelo usado no site.**"
+    alvo = dados.get("resultado_log" if modelo["alvo"] == "log(preco)" else "resultado_preco", "")
+    site = dados.get("site" if modelo.get("no_site", True) else "fora_do_site", "")
+    return " ".join(p for p in (posicao, dados.get("resultado", ""), alvo, site) if p)
 
 
 def marcas_log(lo, hi):
@@ -127,24 +163,28 @@ def grafico_erros(seg, modelo):
 
 
 def grafico_comparacao(seg):
-    modelos = sorted(seg["modelos"], key=lambda m: m["teste_tipico"]["mae"], reverse=True)
-    # MLP e SVM chegam a milhões de erro: corta o eixo e mostra o valor no rótulo.
-    teto = float(np.percentile([m["teste_tipico"]["mae"] for m in modelos], 85)) * 1.15
-    nomes = [("★ " if m["modelo"] == "Ensemble" else "") + f"{m['modelo']} ({m['alvo'] if m['modelo'] != 'Ensemble' else 'site'})" for m in modelos]
-    maes = [m["teste_tipico"]["mae"] for m in modelos]
-    cores = [COR_DESTAQUE if m["modelo"] == "Ensemble" else COR_NEUTRA for m in modelos]
+    # Mesma ordem do critério de escolha (MdAPE na validação cruzada); o melhor fica no topo.
+    modelos = list(reversed(seg["modelos"]))
+    # MLP e SVM chegam a erros enormes: corta o eixo e mostra o valor no rótulo.
+    valores = [m["cv"]["mdape"] for m in modelos]
+    teto = float(np.percentile(valores, 85)) * 1.15
+    nomes = [("★ " if m.get("escolhido") else "") + nome_curto(m) for m in modelos]
+    cores = [COR_DESTAQUE if m.get("escolhido") else COR_NEUTRA for m in modelos]
     fig = go.Figure(
         go.Bar(
-            x=[min(v, teto) for v in maes], y=nomes, orientation="h",
+            x=[min(v, teto) for v in valores], y=nomes, orientation="h",
             marker=dict(color=cores, cornerradius=4),
-            text=[reais(v) + (" (fora da escala)" if v > teto else "") for v in maes],
+            text=[num(v) + "%" + (" (fora da escala)" if v > teto else "") for v in valores],
             textposition="outside", cliponaxis=False,
-            customdata=[m["teste_tipico"]["r2"] for m in modelos],
-            hovertemplate="%{y}<br>Erro médio (MAE): %{text}<br>R²: %{customdata:.3f}<extra></extra>",
+            customdata=[[reais(m["cv"]["mae"]), num(m["teste_tipico"]["erro_mediano_pct"]) + "%"] for m in modelos],
+            hovertemplate=(
+                "%{y}<br>MdAPE validação cruzada: %{text}<br>MAE validação cruzada: %{customdata[0]}"
+                "<br>MdAPE teste: %{customdata[1]}<extra></extra>"
+            ),
         )
     )
-    layout_base(fig, 28 * len(modelos) + 60, "Erro médio no teste (MAE, R$) — menor é melhor", "")
-    fig.update_xaxes(range=[0, teto * 1.35], tickprefix="R$ ", tickformat=",.0f")
+    layout_base(fig, 28 * len(modelos) + 60, "Erro percentual mediano na validação cruzada (MdAPE) — menor é melhor", "")
+    fig.update_xaxes(range=[0, teto * 1.35], ticksuffix="%")
     return fig
 
 
@@ -153,15 +193,32 @@ def tabela_modelos(seg):
     for m in seg["modelos"]:
         t, c, f = m["teste_tipico"], m["cv"], m["teste_completo"]
         linhas.append({
-            "Modelo": m["modelo"],
-            "Alvo": "—" if m["modelo"] == "Ensemble" else m["alvo"],
-            "Posição na validação cruzada": str(m["posicao_cv"] or "—"),
-            "MAE validação cruzada": reais(c["mae"]) if c else "—",
+            "Modelo": ("★ " if m.get("escolhido") else "") + m["modelo"],
+            "Alvo": "3 melhores" if m["modelo"] == "Ensemble" else m["alvo"],
+            "Posição": str(m["posicao_cv"]),
+            "No site": "sim" if m["no_site"] else "não",
+            "MdAPE validação cruzada": num(c["mdape"]) + "%",
+            "MAE validação cruzada": reais(c["mae"]),
+            "MdAPE teste": num(t["erro_mediano_pct"]) + "%",
             "MAE teste": reais(t["mae"]),
             "R² teste": num(t["r2"], 3),
-            "Erro mediano": num(t["erro_mediano_pct"]) + "%",
             "Até ±20%": num(t["ate_20_pct"], 0) + "%",
             "R² teste completo": num(f["r2"], 3),
+        })
+    return pd.DataFrame(linhas)
+
+
+def tabela_tabpfn(tentativas):
+    status = {"ok": "terminou", "cortado": "cortado por tempo", "erro": "erro", "pulado": "não rodou"}
+    linhas = []
+    for t in tentativas:
+        linhas.append({
+            "Variante": t["modelo"],
+            "Linhas de treino": "—" if t["linhas"] is None else (
+                "todas" if t["linhas"] == "todas" else f"{t['linhas']:,}".replace(",", ".")
+            ),
+            "Resultado": status[t["status"]] + (f" ({t['detalhe']})" if t["detalhe"] else ""),
+            "Tempo": f"{t['minutos']:.0f} min" if t["minutos"] else "—",
         })
     return pd.DataFrame(linhas)
 
@@ -175,6 +232,7 @@ def aba_modelos(resultados):
     modelo = modelos[escolha]
     dados = info(modelo["modelo"]) or {}
 
+    st.info(por_que_resultado(seg, modelo, dados), icon="💡")
     e, d = st.columns(2)
     with e:
         st.markdown(f"**{modelo['modelo']}** · {dados.get('familia', '')}")
@@ -189,15 +247,19 @@ def aba_modelos(resultados):
 
     t = modelo["teste_tipico"]
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Erro médio (MAE)", reais(t["mae"]), help="Em média, quanto a previsão erra em reais, no teste.")
-    k2.metric("R²", num(t["r2"], 3), help="Quanto da diferença de preço entre imóveis o modelo explica (1 = tudo).")
-    k3.metric("Erro mediano", num(t["erro_mediano_pct"]) + "%", help="Metade das previsões erra menos que isso.")
+    k1.metric(
+        "Erro mediano (MdAPE)", num(t["erro_mediano_pct"]) + "%",
+        help="Metade das previsões erra menos que isso, no teste. É o critério de escolha do modelo.",
+    )
+    k2.metric("Erro médio (MAE)", reais(t["mae"]), help="Em média, quanto a previsão erra em reais, no teste.")
+    k3.metric("R²", num(t["r2"], 3), help="Quanto da diferença de preço entre imóveis o modelo explica (1 = tudo).")
     k4.metric("Previsões a até ±20%", num(t["ate_20_pct"], 0) + "%")
     cv = modelo["cv"]
+    treino = f" Treinado com {modelo['linhas_treino']:,} linhas.".replace(",", ".") if "linhas_treino" in modelo else ""
     st.caption(
-        (f"Validação cruzada no treino: MAE {reais(cv['mae'])}, R² {num(cv['r2'], 3)}. " if cv else "")
+        f"Validação cruzada no treino: MdAPE {num(cv['mdape'])}%, MAE {reais(cv['mae'])}, R² {num(cv['r2'], 3)}. "
         + f"Teste completo (com os anúncios fora do padrão): R² {num(modelo['teste_completo']['r2'], 3)}. "
-        + f"Teste com {seg['linhas_teste_tipico']} {tipo.lower()}s que o modelo nunca viu."
+        + f"Teste com {seg['linhas_teste_tipico']} {tipo.lower()}s que o modelo nunca viu.{treino}"
     )
 
     st.markdown("**Preço previsto x preço real no teste**")
@@ -214,14 +276,37 @@ def aba_comparacao(resultados):
     tipo = st.radio("Tipo", TIPOS, horizontal=True, key="av_tipo_comp")
     seg = resultados["segmentos"][tipo]
     st.plotly_chart(grafico_comparacao(seg), width="stretch", config=SEM_BARRA)
-    st.caption("★ = ensemble usado no site. Todos medidos no mesmo teste, que nenhum modelo viu no treino.")
+    st.caption(
+        "★ = modelo usado no site: o de menor erro percentual mediano (MdAPE) na validação cruzada "
+        "entre os que podem ser usados no site (inclui o TabPFN pela API da Prior Labs), com o ensemble "
+        "concorrendo como mais um candidato; em caso de "
+        "empate (mesmo MdAPE com 1 casa decimal), vence o de menor MAE. Todos treinados com os mesmos "
+        "dados (reais + histórico simulado) e medidos só em preços reais."
+    )
     st.dataframe(tabela_modelos(seg), hide_index=True, width="stretch")
+    if seg.get("tabpfn_tentativas"):
+        st.markdown("**Tentativas do TabPFN**")
+        st.caption(
+            "O TabPFN foi pré-treinado com até cerca de 10 mil linhas, e o treino da v3 tem mais que isso. "
+            "Cada tentativa (todas as linhas, depois 10 mil e 3 mil sorteadas) teve um corte de "
+            "tempo; vale a primeira que terminou. No computador, ele não vai para o site: precisa de "
+            "PyTorch e leva minutos por previsão. Já o TabPFN 3.5 pela API roda no servidor da Prior Labs, "
+            "usa todas as linhas e responde em segundos, por isso pode ser usado no site."
+        )
+        st.dataframe(tabela_tabpfn(seg["tabpfn_tentativas"]), hide_index=True, width="stretch")
 
 
 def aba_dataset():
-    df = carregar_dataset()
+    base = st.radio(
+        "Registros",
+        ["Reais + histórico simulado (dataset de treino da v3)", "Só os anúncios reais"],
+        horizontal=True,
+        help="Simulados: para cada imóvel real, um registro por ano de 2016 a 2025 com o preço levado "
+        "a junho de cada ano pelo índice IPCA+INCC realizado. São uma hipótese, não preços observados.",
+    )
+    df = carregar_dataset(com_simulados=base != "Só os anúncios reais")
     if df is None:
-        st.info("Dataset não encontrado. Gere com: `python scripts_predict/resultados_modelos.py`")
+        st.info("Dataset não encontrado. Gere com: `python scripts_predict/modelo_v3.py`")
         return
     df = df.assign(bairro=df["bairro"].fillna("").map(lambda b: b.title() if b else "(sem bairro)"))
     c1, c2, c3 = st.columns([1, 2, 2])
@@ -240,9 +325,20 @@ def aba_dataset():
     sub = df[filtro]
 
     k1, k2, k3 = st.columns(3)
-    k1.metric("Imóveis", f"{len(sub):,}".replace(",", "."))
-    k2.metric("Preço mediano", reais(sub["preco"].median()) if len(sub) else "—")
-    k3.metric("Preço/m² mediano", reais(sub["preco_m2"].median()) if len(sub) else "—")
+    if "origem" in sub:
+        # Base v3: cada imóvel aparece uma vez por ano; as medianas usam só os reais.
+        reais_sub = sub[sub["origem"] == "real"]
+        k1.metric(
+            "Imóveis",
+            f"{len(reais_sub):,}".replace(",", "."),
+            help=f"{len(sub):,} registros: cada imóvel real + 1 simulado por ano.".replace(",", "."),
+        )
+    else:
+        reais_sub = sub
+        k1.metric("Imóveis", f"{len(sub):,}".replace(",", "."))
+    sufixo = " (reais, em ago/2026)" if "origem" in sub else ""
+    k2.metric("Preço mediano" + sufixo, reais(reais_sub["preco"].median()) if len(reais_sub) else "—")
+    k3.metric("Preço/m² mediano" + sufixo, reais(reais_sub["preco_m2"].median()) if len(reais_sub) else "—")
     st.dataframe(
         sub,
         hide_index=True,
@@ -257,6 +353,15 @@ def aba_dataset():
             "vagas": "Vagas",
             "preco": st.column_config.NumberColumn("Preço (R$)", format="localized"),
             "preco_m2": st.column_config.NumberColumn("Preço/m² (R$)", format="%.0f"),
+            "imovel": st.column_config.NumberColumn("Imóvel (nº)", format="%d"),
+            "mes": "Mês do preço",
+            "mes_anuncio": "Mês do anúncio",
+            "preco_anunciado": st.column_config.NumberColumn(
+                "Preço anunciado (R$)", format="localized",
+                help="Preço do anúncio no mês em que foi coletado (só nos reais). A coluna Preço traz o "
+                "valor levado a ago/2026 pelo índice IPCA+INCC, como no treino.",
+            ),
+            "origem": "Origem",
         },
     )
     st.download_button(
@@ -269,18 +374,28 @@ def aba_dataset():
     )
 
 
-def tela_avancada():
-    st.subheader("Modo avançado")
+def tela_modelos():
+    st.subheader("Modelos de preço treinados (versão 3)")
     resultados = carregar_resultados()
     if resultados is None:
-        st.info("Resultados dos modelos não encontrados. Gere com: `python scripts_predict/resultados_modelos.py`")
-        aba_dataset()
+        st.info("Resultados não encontrados. Gere com: `python scripts_predict/resultados_v3.py`")
         return
+    st.markdown(POR_QUE_GERAL)
     st.caption(f"Resultados gerados em {resultados['gerado_em'][:10]}. Protocolo: {resultados['protocolo']}.")
-    a1, a2, a3 = st.tabs(["Modelos", "Comparação", "Dataset"])
+    a1, a2 = st.tabs(["Um modelo por vez", "Todos lado a lado"])
     with a1:
         aba_modelos(resultados)
     with a2:
         aba_comparacao(resultados)
-    with a3:
-        aba_dataset()
+
+
+def tela_dataset():
+    st.subheader("Dataset usado no treino")
+    st.markdown(
+        "Anúncios de casas e apartamentos coletados de 8 imobiliárias de Chapecó em 12 coletas "
+        "(mar a ago/2026), depois de unificados, sem duplicados e padronizados: **3.283 imóveis "
+        "reais**. Na versão 3, cada imóvel ganha 10 registros **simulados** (2016 a 2025), com o "
+        "preço levado a cada ano pelo índice IPCA+INCC. Os modelos são treinados com reais + "
+        "simulados e avaliados **só com os reais**."
+    )
+    aba_dataset()

@@ -1,11 +1,18 @@
-"""Interface do TCC: estimativa do valor de um imóvel hoje e ao longo dos anos.
+"""Interface do TCC (versão 3): valor de um imóvel hoje, no passado e ao longo dos anos.
 
 Rodar a partir da raiz do projeto:
     streamlit run interface/app.py
 
-Precisa dos modelos treinados:
-    python scripts_predict/imoveis_ml_hibrido.py train-hibrido   (valor hoje)
-    python scripts_predict/imoveis_projecao.py train-projecao     (valorização anual)
+Usa só a versão 3:
+- modelo de preço v3 (`scripts_predict/modelo_v3.py`): anúncios reais + histórico
+  simulado pelo índice IPCA+INCC;
+- valorização v3 (`scripts_predict/imoveis_projecao.py`, versao="v3"): taxa medida nos
+  anúncios combinada com o índice IPCA+INCC.
+
+Precisa de:
+    python scripts_predict/modelo_v3.py                           (modelo de preço v3)
+    python scripts_predict/imoveis_projecao.py train-projecao     (taxas por bairro)
+    python scripts_predict/resultados_v3.py                       (aba de modelos)
 """
 
 import json
@@ -22,9 +29,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "scripts_predict"))
 
 from imoveis_ml_hibrido import format_currency, input_warnings  # noqa: E402
-from ivgr import load_ivgr  # noqa: E402
-from modo_avancado import tela_avancada  # noqa: E402
-from imoveis_ml_hibrido import load_artifact as load_price_artifact  # noqa: E402
 from imoveis_projecao import (  # noqa: E402
     MAX_ANOS,
     ajustar_referencia,
@@ -34,47 +38,75 @@ from imoveis_projecao import (  # noqa: E402
     project,
     reference_rate,
 )
+from indice_ipca_incc import resumo as resumo_ipca_incc  # noqa: E402
+from ivgr import load_ivgr  # noqa: E402
+from modelo_v3 import MEIO_DO_ANO, carregar_segmento, load_v3, modelo_api, prever_precos_v3  # noqa: E402
+from modo_avancado import tela_dataset, tela_modelos  # noqa: E402
 
-PRICE_MODEL = Path(
-    os.getenv(
-        "MODELO_PRECO",
-        PROJECT_ROOT / "modelos" / "preco_imovel_modelo_hibrido_rapido.pkl",
-    )
-)
-PROJECTION_MODEL = Path(
-    os.getenv("MODELO_PROJECAO", PROJECT_ROOT / "modelos" / "projecao_modelo.pkl")
-)
+MODELO_V3 = Path(os.getenv("MODELO_PRECO_V3", PROJECT_ROOT / "modelos" / "preco_imovel_modelo_v3.pkl"))
+PROJECTION_MODEL = Path(os.getenv("MODELO_PROJECAO", PROJECT_ROOT / "modelos" / "projecao_modelo.pkl"))
 BAIRROS_JSON = PROJECT_ROOT / "dados" / "bairros.json"
 NORMALIZED_DB = PROJECT_ROOT / "imoveis_normalizados.db"
 TIPOS = ("Apartamento", "Casa")
-VERSOES = {
-    "v2 — anúncios + IVG-R, índice de imóveis (recomendada)": "v2-ivgr",
-    "v2 — anúncios + IPCA": "v2",
-    "v1 — só os anúncios": "v1",
-}
-NOME_INDICE = {"v2-ivgr": "IVG-R (índice de imóveis do Banco Central)", "v2": "IPCA"}
+VERSAO = "v3"
+ANOS_PASSADO = list(range(2016, 2026))  # junho de cada ano simulado; o último ponto é hoje
+MESES = ("jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez")
 
 # Paleta de referência (skill de visualização): série 1 = azul, série 2 = laranja.
 COR_CENTRAL = "#2a78d6"
 COR_FAIXA = "rgba(42, 120, 214, 0.15)"
 COR_REFERENCIA = "#eb6834"
 
-st.set_page_config(
-    page_title="Valor do imóvel ao longo dos anos", page_icon="🏠", layout="wide"
-)
+st.set_page_config(page_title="Valor do imóvel ao longo dos anos", page_icon="🏠", layout="wide")
 
 
 # ------------------------------------------------------------------ dados
 @st.cache_resource(show_spinner="Carregando modelos...")
 def carregar_modelos():
-    faltando = [p.name for p in (PRICE_MODEL, PROJECTION_MODEL) if not p.exists()]
+    faltando = [p.name for p in (MODELO_V3, PROJECTION_MODEL) if not p.exists()]
     if faltando:
         return None, None, faltando
-    return (
-        load_price_artifact(PRICE_MODEL),
-        load_projection_artifact(PROJECTION_MODEL),
-        [],
-    )
+    return load_v3(MODELO_V3), load_projection_artifact(PROJECTION_MODEL), []
+
+
+def token_tabpfn():
+    """Chave da API da Prior Labs: Secrets do Streamlit (site publicado), variável de ambiente ou,
+    no computador, o token salvo ao aceitar a licença."""
+    try:
+        token = st.secrets.get("TABPFN_TOKEN")
+    except Exception:  # noqa: BLE001 - sem secrets.toml
+        token = None
+    if token:
+        return token
+    from tabpfn_model import prior_labs_token
+
+    return prior_labs_token()
+
+
+@st.cache_resource(show_spinner="Conectando ao TabPFN (API da Prior Labs)...")
+def modelo_tabpfn(_art, tipo):
+    """TabPFN pela API, ajustado com o treino do tipo; None se não houver chave ou a API falhar."""
+    seg = carregar_segmento(_art, tipo)
+    token = token_tabpfn()
+    if not seg.get("api") or not token:
+        return None
+    os.environ["TABPFN_TOKEN"] = token
+    try:
+        return modelo_api(seg["api"]["treino"])
+    except Exception as exc:  # noqa: BLE001 - sem a API, o site usa a reserva
+        print(f"[aviso] TabPFN pela API indisponível: {exc}", flush=True)
+        return None
+
+
+@st.cache_data(show_spinner="Estimando o valor...", max_entries=500)
+def estimar_precos(_art, anos, **dados):
+    """Preços do imóvel em cada ano e o modelo usado. Guardado em cache: cada consulta nova
+    ao TabPFN gasta cota da API."""
+    api = modelo_tabpfn(_art, dados["tipo_imovel"])
+    precos, usado = prever_precos_v3(_art, list(anos), api=api, **dados)
+    if api is not None and usado != carregar_segmento(_art, dados["tipo_imovel"])["api"]["model"]:
+        modelo_tabpfn.clear()  # o modelo na API pode ter expirado: ajusta de novo na próxima vez
+    return precos, usado
 
 
 @st.cache_data(show_spinner=False)
@@ -87,6 +119,22 @@ def carregar_bairros():
     return {t: [] for t in TIPOS}
 
 
+@st.cache_data(show_spinner=False)
+def carregar_ivgr():
+    return load_ivgr(atualizar=False)
+
+
+@st.cache_data(show_spinner=False)
+def carregar_ipca_incc():
+    return resumo_ipca_incc()
+
+
+def ano_hoje(proj_art):
+    """Mês da última coleta na convenção do modelo v3 (ago/2026 -> 2026 + 7,5/12)."""
+    mes = pd.Period(proj_art["ultimo_mes"], freq="M")
+    return mes.year + (mes.month - 0.5) / 12
+
+
 def pct(valor, casas=2):
     """Porcentagem com sinal no formato brasileiro (ex.: +0,65%)."""
     return f"{valor:+.{casas}f}%".replace(".", ",")
@@ -96,19 +144,26 @@ def rotulo_bairro(bairro):
     return bairro.title() if bairro else bairro
 
 
+def descrever_modelo(art, tipo, usado=None):
+    """Modelo que fez a estimativa: o TabPFN pela API, um modelo só ou a média ponderada (ensemble)."""
+    seg = art["segments"][tipo]
+    if seg.get("api") and usado == seg["api"]["model"]:
+        return f"{usado}, rodando no servidor da Prior Labs."
+    membros = seg["selected"]
+    if len(membros) == 1:
+        return f"{membros[0]['model_name']} (alvo {membros[0]['target']})."
+    partes = "; ".join(
+        f"{m['model_name']} ({m['target']}, peso {m['weight']:.2f})".replace(".", ",") for m in membros
+    )
+    return f"média ponderada (ensemble) de {partes}."
+
+
 # --------------------------------------------------------------- gráficos
 def grafico_projecao(tabela, taxa_referencia, rotulo_referencia):
     anos = tabela["ano"]
     fig = go.Figure()
     fig.add_trace(
-        go.Scatter(
-            x=anos,
-            y=tabela["otimista"],
-            mode="lines",
-            line=dict(width=0),
-            hoverinfo="skip",
-            showlegend=False,
-        )
+        go.Scatter(x=anos, y=tabela["otimista"], mode="lines", line=dict(width=0), hoverinfo="skip", showlegend=False)
     )
     fig.add_trace(
         go.Scatter(
@@ -120,9 +175,7 @@ def grafico_projecao(tabela, taxa_referencia, rotulo_referencia):
             fillcolor=COR_FAIXA,
             name="Faixa pessimista–otimista",
             customdata=tabela[["otimista"]],
-            hovertemplate=(
-                "Pessimista: R$ %{y:,.0f}<br>Otimista: R$ %{customdata[0]:,.0f}<extra></extra>"
-            ),
+            hovertemplate="Pessimista: R$ %{y:,.0f}<br>Otimista: R$ %{customdata[0]:,.0f}<extra></extra>",
         )
     )
     fig.add_trace(
@@ -153,17 +206,30 @@ def grafico_projecao(tabela, taxa_referencia, rotulo_referencia):
         hovermode="x unified",
         separators=",.",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-        xaxis=dict(
-            title="Anos a partir de hoje",
-            dtick=1 if len(anos) <= 16 else 2,
-            showgrid=False,
-        ),
-        yaxis=dict(
-            title="Valor estimado (R$)",
-            tickprefix="R$ ",
-            tickformat=",.0f",
-            gridcolor="rgba(128,128,128,0.2)",
-        ),
+        xaxis=dict(title="Anos a partir de hoje", dtick=1 if len(anos) <= 16 else 2, showgrid=False),
+        yaxis=dict(title="Valor estimado (R$)", tickprefix="R$ ", tickformat=",.0f", gridcolor="rgba(128,128,128,0.2)"),
+    )
+    return fig
+
+
+def grafico_passado(passado):
+    fig = go.Figure(
+        go.Scatter(
+            x=passado["Ano"],
+            y=passado["Valor estimado"],
+            mode="lines+markers",
+            line=dict(color=COR_CENTRAL, width=2, dash="dot"),
+            marker=dict(size=8),
+            hovertemplate="%{x}: R$ %{y:,.0f}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        height=320,
+        margin=dict(l=10, r=10, t=10, b=10),
+        separators=",.",
+        showlegend=False,
+        xaxis=dict(title="", showgrid=False, type="category"),
+        yaxis=dict(title="Valor estimado (R$)", tickprefix="R$ ", tickformat=",.0f", gridcolor="rgba(128,128,128,0.2)"),
     )
     return fig
 
@@ -181,16 +247,18 @@ def tabela_formatada(tabela, rotulo_referencia):
     return out
 
 
-@st.cache_data(show_spinner=False)
-def carregar_ivgr():
-    return load_ivgr(atualizar=False)
-
-
+# ---------------------------------------------------------------- entradas
 def escolher_referencia(proj_art):
-    """Seletor do cenário de referência: IPCA (padrão), IVG-R, outra taxa ou nenhum."""
+    """Linha de comparação no gráfico: IPCA+INCC (padrão), IPCA, IVG-R, outra taxa ou nenhuma."""
     ipca = proj_art.get("ipca")
     ivgr = carregar_ivgr()
+    combinado = carregar_ipca_incc()
     opcoes = {}
+    if combinado:
+        opcoes[f"IPCA+INCC média 10 anos ({pct(combinado['media_anual_pct'])} ao ano)"] = (
+            combinado["media_anual_pct"],
+            "IPCA+INCC média 10 anos",
+        )
     if ipca:
         for escolha in ("ipca-media", "ipca-12m"):
             taxa, rotulo = reference_rate(proj_art, escolha)
@@ -204,8 +272,10 @@ def escolher_referencia(proj_art):
         "Comparar com",
         list(opcoes),
         help=(
-            (f"IPCA: {ipca['fonte']}, {ipca['inicio']} a {ipca['fim']}. " if ipca else "")
-            + (f"IVG-R: {ivgr['fonte']}, {ivgr['inicio']} a {ivgr['fim']}." if ivgr else "")
+            "Linha tracejada no gráfico: quanto o imóvel valeria se só acompanhasse o índice. "
+            + (f"IPCA+INCC: {combinado['fonte']}. " if combinado else "")
+            + (f"IPCA: {ipca['fonte']}. " if ipca else "")
+            + (f"IVG-R: {ivgr['fonte']}." if ivgr else "")
         ),
     )
     if opcoes[escolha] is None:
@@ -214,14 +284,14 @@ def escolher_referencia(proj_art):
     return opcoes[escolha]
 
 
-def escolher_contagem(coluna, rotulo, price_art, tipo, campo, padrao):
+def escolher_contagem(coluna, rotulo, art, tipo, campo, padrao):
     """Lista suspensa de 0 até o máximo visto no treino para o tipo de imóvel."""
-    limites = price_art["segments"][tipo]["clip_bounds"].get(campo)
-    maximo = int(np.ceil(limites[1])) if limites else 10
-    opcoes = list(range(0, maximo + 1))
+    limites = art["segments"][tipo]["clip_bounds"].get(campo)
+    # floor: o máximo oferecido nunca passa do limite de treino (ex.: 4,64 vagas -> 4).
+    maximo = max(1, int(np.floor(limites[1]))) if limites else 10
     return coluna.selectbox(
         rotulo,
-        opcoes,
+        list(range(0, maximo + 1)),
         index=min(padrao, maximo),
         format_func=lambda v: "—" if v == 0 else str(v),
         key=f"{campo}_{tipo}",
@@ -230,7 +300,7 @@ def escolher_contagem(coluna, rotulo, price_art, tipo, campo, padrao):
 
 
 # ------------------------------------------------------------------ telas
-def tela_estimativa(price_art, proj_art):
+def tela_estimativa(art, proj_art):
     bairros = carregar_bairros()
 
     with st.sidebar:
@@ -242,7 +312,11 @@ def tela_estimativa(price_art, proj_art):
 
         c1, c2 = st.columns(2)
         area_privada = c1.number_input(
-            "Área privativa (m²)", min_value=0.0, value=80.0, step=5.0, format="%.0f"
+            "Área privativa (m²)",
+            min_value=0.0,
+            value=80.0 if tipo == "Apartamento" else 150.0,
+            step=5.0,
+            format="%.0f",
         )
         area_total = c2.number_input(
             "Área total (m²)",
@@ -252,52 +326,46 @@ def tela_estimativa(price_art, proj_art):
             format="%.0f",
         )
         c1, c2, c3 = st.columns(3)
-        quartos = escolher_contagem(c1, "Quartos", price_art, tipo, "quartos", padrao=2)
-        banheiros = escolher_contagem(c2, "Banheiros", price_art, tipo, "banheiros", padrao=2)
-        vagas = escolher_contagem(c3, "Vagas", price_art, tipo, "vagas", padrao=1)
+        quartos = escolher_contagem(c1, "Quartos", art, tipo, "quartos", padrao=2 if tipo == "Apartamento" else 3)
+        banheiros = escolher_contagem(c2, "Banheiros", art, tipo, "banheiros", padrao=2)
+        vagas = escolher_contagem(c3, "Vagas", art, tipo, "vagas", padrao=1)
 
         st.header("Projeção")
         anos = st.slider("Horizonte (anos)", min_value=1, max_value=MAX_ANOS, value=10)
-        versao_rotulo = st.radio(
-            "Valorização",
-            list(VERSOES),
-            help=(
-                "v2: combina a valorização medida nos anúncios com um índice de 10 anos (IVG-R, "
-                "de imóveis, ou IPCA, inflação), porque 5 meses de preços quase parados medem "
-                "pouco. v1: só o que os anúncios mostraram."
-            ),
-        )
-        versao = VERSOES[versao_rotulo]
         taxa_ref, rotulo_ref = escolher_referencia(proj_art)
         with st.expander("Opções avançadas"):
             usar_preco = st.checkbox("Informar o preço atual em vez de estimar")
             preco_atual = st.number_input(
-                "Preço atual (R$)",
-                min_value=0.0,
-                value=500_000.0,
-                step=10_000.0,
-                disabled=not usar_preco,
+                "Preço atual (R$)", min_value=0.0, value=500_000.0, step=10_000.0, disabled=not usar_preco
             )
 
     if area_privada <= 0 and area_total <= 0:
         st.warning("Informe a área privativa ou a área total.")
         return
 
+    dados = dict(
+        area_total=area_total,
+        area_privada=area_privada,
+        bairro=bairro,
+        tipo_imovel=tipo,
+        quartos=quartos,
+        banheiros=banheiros,
+        vagas=vagas,
+    )
+    # Uma consulta só para os anos anteriores (junho) e hoje: no TabPFN pela API, cada consulta gasta cota.
+    precos, usado = estimar_precos(art, tuple([a + MEIO_DO_ANO for a in ANOS_PASSADO] + [ano_hoje(proj_art)]), **dados)
+    seg = art["segments"][tipo]
+    na_api = bool(seg.get("api")) and usado == seg["api"]["model"]
     try:
         res = project(
             proj_art,
-            price_art,
-            bairro=bairro,
-            tipo_imovel=tipo,
-            area_total=area_total,
-            area_privada=area_privada,
-            quartos=quartos,
-            banheiros=banheiros,
-            vagas=vagas,
+            art,
             anos=anos,
             preco_atual=preco_atual if usar_preco and preco_atual > 0 else None,
             taxa_referencia=taxa_ref,
-            versao=versao,
+            versao=VERSAO,
+            valor_estimado=precos[-1],
+            **dados,
         )
     except ValueError as exc:
         st.error(str(exc))
@@ -308,16 +376,7 @@ def tela_estimativa(price_art, proj_art):
 
     st.subheader(f"{tipo} no bairro {rotulo_bairro(bairro)}")
     if not res["usou_preco_informado"]:
-        avisos = input_warnings(
-            price_art,
-            area_total=area_total,
-            area_privada=area_privada,
-            bairro=bairro,
-            tipo_imovel=tipo,
-            quartos=quartos,
-            banheiros=banheiros,
-            vagas=vagas,
-        )
+        avisos = input_warnings(art, **dados)
         if avisos:
             st.warning(
                 "**Estimativa pouco confiável: este imóvel foge do padrão dos dados de treino.**\n\n"
@@ -329,7 +388,8 @@ def tela_estimativa(price_art, proj_art):
         "Valor estimado hoje",
         format_currency(res["valor_hoje"]),
         help=(
-            "Modelo de preço híbrido (ensemble por tipo de imóvel)."
+            f"Modelo de preço v3: {descrever_modelo(art, tipo, usado)} Escolhido pelo menor erro percentual "
+            "mediano (MdAPE) na validação cruzada; veja a aba Modelos."
             if not res["usou_preco_informado"]
             else "Preço informado por você."
         ),
@@ -344,63 +404,82 @@ def tela_estimativa(price_art, proj_art):
         pct(res["taxa_anual_central_pct"]),
         help=f"Faixa: {pct(res['taxa_anual_pessimista_pct'])} a {pct(res['taxa_anual_otimista_pct'])} ao ano.",
     )
-    if res["versao"] in NOME_INDICE:
-        st.caption(
-            f"Valorização v2: {res['peso_dados'] * 100:.0f}% vem da variação medida nos anúncios "
-            f"({len(proj_art['meses'])} meses de coleta) e {(1 - res['peso_dados']) * 100:.0f}% do "
-            f"{NOME_INDICE[res['versao']]} dos últimos 10 anos. Com mais meses de coleta, o peso "
-            "dos anúncios aumenta."
-        )
-
+    st.caption(
+        f"Valorização: {res['peso_dados'] * 100:.0f}% vem da variação medida nos anúncios "
+        f"({len(proj_art['meses'])} meses de coleta) e {(1 - res['peso_dados']) * 100:.0f}% do índice "
+        "IPCA+INCC (inflação e custo da construção) dos últimos 10 anos. Com mais meses de coleta, "
+        "o peso dos anúncios aumenta."
+    )
     if taxa_ref is not None:
-        final_ref = final["referencia"]
         st.caption(
             f"Se acompanhasse apenas a referência ({rotulo_ref}, {pct(taxa_ref)} ao ano), "
-            f"valeria {format_currency(final_ref)} em {anos} ano(s)."
+            f"valeria {format_currency(final['referencia'])} em {anos} ano(s)."
         )
     if not res["usou_preco_informado"]:
+        erro = seg["metrics"]["mae"] if na_api or not seg.get("api") else seg["metrics_reserva"]["mae"]
         st.caption(
-            f"Erro típico do modelo de preço para {tipo.lower()}s: "
-            f"± {format_currency(res['erro_tipico_modelo_preco'])} (MAE no teste)."
+            f"Modelo usado: {descrever_modelo(art, tipo, usado)} Erro típico para {tipo.lower()}s: "
+            f"± {format_currency(erro)} (MAE no teste com preços reais)."
         )
+        if na_api:
+            st.caption(
+                "As características informadas (sem nenhum dado pessoal) e os anúncios de treino são "
+                "enviados ao servidor da Prior Labs, que roda o TabPFN."
+            )
+        elif seg.get("api"):
+            st.info(
+                f"O modelo escolhido para {tipo.lower()}s é o {seg['api']['model']}, que roda no servidor "
+                "da Prior Labs, mas ele não respondeu agora. A estimativa usa o melhor modelo que roda no "
+                "próprio site.",
+                icon="ℹ️",
+            )
     else:
-        st.caption(
-            f"O modelo estimaria {format_currency(res['valor_modelo_hoje'])} para este imóvel."
-        )
+        st.caption(f"O modelo estimaria {format_currency(res['valor_modelo_hoje'])} para este imóvel.")
     if res["taxa_origem"] == "tipo":
         st.info(
-            f"O bairro tem poucos imóveis acompanhados ao longo dos meses; foi usada a taxa geral "
-            f"de {tipo.lower()}s."
+            f"O bairro tem poucos imóveis acompanhados ao longo dos meses; foi usada a taxa geral de {tipo.lower()}s."
         )
 
+    st.markdown("**Ao longo dos próximos anos**")
     st.plotly_chart(grafico_projecao(tabela, taxa_ref, rotulo_ref), width="stretch")
-
     with st.expander("Ver tabela ano a ano"):
-        st.dataframe(
-            tabela_formatada(tabela, rotulo_ref), hide_index=True, width="stretch"
-        )
+        st.dataframe(tabela_formatada(tabela, rotulo_ref), hide_index=True, width="stretch")
+
+    st.markdown("**Quanto este imóvel valia nos anos anteriores**")
+    mes_hoje = pd.Period(proj_art["ultimo_mes"], freq="M")
+    passado = pd.DataFrame(
+        {
+            "Ano": [f"jun/{a}" for a in ANOS_PASSADO] + [f"{mes_hoje.strftime('%m/%Y')} (hoje)"],
+            "Valor estimado": precos[:-1] + [res["valor_modelo_hoje"]],
+        }
+    )
+    st.plotly_chart(grafico_passado(passado), width="stretch")
+    st.caption(
+        "Estimativa do modelo v3, treinado com os anúncios reais e com um passado SIMULADO para cada "
+        "imóvel: o preço anunciado levado a cada ano pelo índice IPCA+INCC realizado. É coerente com a "
+        "inflação e o custo da construção, mas não é um preço observado. Valores de junho de cada ano; "
+        "o último ponto é o valor de hoje."
+    )
 
     with st.expander("Como a estimativa é feita e limitações"):
         st.markdown(f"""
-1. **Valor hoje**: modelo de preço treinado com anúncios coletados de imobiliárias de Chapecó
-   (bairro, tipo, áreas, quartos, banheiros e vagas).
-2. **Valorização**: variação do preço anunciado dos *mesmos* imóveis entre as coletas
-   ({", ".join(proj_art["meses"])}), anualizada. Bairros com poucos imóveis são aproximados da
-   taxa do tipo de imóvel.
-3. **Valorização v2** (padrão): como o preço anunciado quase não muda (96% dos anúncios ficam
-   iguais de um mês para o outro), 5 meses medem pouco. A v2 parte da média de 10 anos de um
-   índice e dá à taxa medida um peso de T / (T + 12), em que T são os meses de coleta. O
-   índice padrão é o **IVG-R** (Banco Central), que mede o valor de avaliação de imóveis
-   financiados: é um índice de imóveis, mas nacional. A alternativa é o IPCA (inflação
-   geral). A v1 usa só a taxa medida.
-4. **Faixa**: v1, intervalo de 80% da taxa estimada por bootstrap; v2, a mesma faixa
-   combinada com a variação do índice em 12 meses (percentis 10 e 90 dos últimos 10 anos).
-5. **Referência**: IPCA oficial (IBGE) ou IVG-R, via Banco Central: quanto o imóvel valeria
-   se apenas acompanhasse o índice. Não há índice FipeZap para Chapecó.
+1. **Valor hoje**: modelo de preço v3, treinado com os anúncios coletados de 8 imobiliárias de
+   Chapecó (bairro, tipo, áreas, quartos, banheiros e vagas) e com um histórico simulado de
+   2016 a 2025. Erro medido só em preços reais que o modelo nunca viu.
+2. **Índice IPCA+INCC**: média das variações mensais da inflação (IPCA) e do custo da
+   construção (INCC), séries do Banco Central. Lógica: o terreno e o bem acompanham a
+   inflação; a construção acompanha o custo de construir.
+3. **Valorização**: a variação do preço anunciado dos *mesmos* imóveis entre as coletas
+   ({", ".join(proj_art["meses"])}) quase não mostra nada, porque 96% dos anúncios mantêm o
+   preço de um mês para o outro. Por isso a taxa parte do índice IPCA+INCC (média de 10
+   anos) e dá aos anúncios um peso de T / (T + 12), em que T são os meses de coleta. As
+   diferenças entre bairros vêm dos anúncios.
+4. **Faixa**: combina o intervalo de 80% da taxa medida (bootstrap) com a variação do índice
+   em 12 meses (percentis 10 e 90 dos últimos 10 anos).
+5. **Passado**: o histórico simulado é uma hipótese (o imóvel teria acompanhado o índice).
 
-**Limitações**: poucos meses de coleta extrapolados para anos; preço anunciado não é preço de
-venda; imóveis vendidos saem da base; anúncios raramente mudam de preço, o que tende a
-subestimar a valorização. A projeção é um cenário, não uma garantia.
+**Limitações**: preço anunciado não é preço de venda; poucos meses de coleta; sem endereço,
+idade ou acabamento do imóvel. A projeção é um cenário, não uma garantia.
 """)
 
 
@@ -409,68 +488,54 @@ def tela_bairros(proj_art):
     rows = []
     for key, r in proj_art["segmentos"].items():
         bairro, tipo = key.split("|")
+        v3, _ = ajustar_referencia(r, proj_art, "ipca_incc")
         rows.append(
             {
                 "Bairro": rotulo_bairro(bairro) or "(sem bairro)",
                 "Tipo": tipo,
-                "Imóveis": r["imoveis"],
-                "Central v2 IVG-R (%/ano)": round(annual_pct(ajustar_referencia(r, proj_art, "ivgr")[0]["mensal"]), 2),
-                "Central v2 IPCA (%/ano)": round(annual_pct(ajustar_referencia(r, proj_art, "ipca")[0]["mensal"]), 2),
-                "Central (%/ano)": round(annual_pct(r["mensal"]), 2),
-                "Pessimista (%/ano)": round(annual_pct(r["mensal_baixa"]), 2),
-                "Otimista (%/ano)": round(annual_pct(r["mensal_alta"]), 2),
+                "Imóveis acompanhados": r["imoveis"],
+                "Central (%/ano)": annual_pct(v3["mensal"]),
+                "Pessimista (%/ano)": annual_pct(v3["mensal_baixa"]),
+                "Otimista (%/ano)": annual_pct(v3["mensal_alta"]),
             }
         )
     df = pd.DataFrame(rows)
     tipo = st.radio("Tipo", TIPOS, horizontal=True, key="tipo_bairros")
     df = df[df["Tipo"] == tipo].sort_values("Central (%/ano)", ascending=False)
-    df = df.rename(
-        columns={
-            "Central (%/ano)": "Central v1 (%/ano)",
-            "Pessimista (%/ano)": "Pessimista v1 (%/ano)",
-            "Otimista (%/ano)": "Otimista v1 (%/ano)",
-        }
-    )
-    for col in (
-        "Central v2 IVG-R (%/ano)",
-        "Central v2 IPCA (%/ano)",
-        "Central v1 (%/ano)",
-        "Pessimista v1 (%/ano)",
-        "Otimista v1 (%/ano)",
-    ):
+    for col in ("Central (%/ano)", "Pessimista (%/ano)", "Otimista (%/ano)"):
         df[col] = df[col].map(pct)
-    geral = proj_art["tipos"][tipo]
+    geral, _ = ajustar_referencia(proj_art["tipos"][tipo], proj_art, "ipca_incc")
     st.caption(
         f"Taxa geral de {tipo.lower()}s: {pct(annual_pct(geral['mensal']))} ao ano "
-        f"({geral['imoveis']} imóveis acompanhados). v1 = só os anúncios; v2 = anúncios "
-        "combinados com o IVG-R (índice de imóveis) ou com o IPCA (ver \"Como a estimativa é "
-        "feita\" na aba Estimativa)."
+        f"({proj_art['tipos'][tipo]['imoveis']} imóveis acompanhados). Cada taxa combina a variação "
+        "medida nos anúncios do bairro com o índice IPCA+INCC (ver \"Como a estimativa é feita\")."
     )
     st.dataframe(df.drop(columns="Tipo"), hide_index=True, width="stretch")
 
 
-def tela_modelos(price_art, proj_art):
-    st.subheader("Desempenho do modelo de preço (conjunto de teste)")
-    rows = []
-    for tipo, seg in price_art["segments"].items():
-        m = seg["metrics"]
-        rows.append(
-            {
-                "Tipo": tipo,
-                "Imóveis no treino": seg["rows"],
-                "MAE": format_currency(m["mae"]),
-                "RMSE": format_currency(m["rmse"]),
-                "R²": f"{m['r2']:.3f}".replace(".", ","),
-                "Modelos no ensemble": ", ".join(
-                    f"{s['model_name']} ({s['target']})" for s in seg["selected"]
-                ),
-            }
-        )
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    st.caption(
-        f"Modelo de preço treinado em {price_art['trained_at'][:10]}; "
-        f"taxas de valorização calculadas em {proj_art['trained_at'][:10]} "
-        f"com coletas até {proj_art['ultimo_mes']}."
+def mes_ano(periodo):
+    """'2016-10' -> 'out/2016'."""
+    mes = pd.Period(periodo, freq="M")
+    return f"{MESES[mes.month - 1]}/{mes.year}"
+
+
+def explicar_indice(proj_art):
+    """Qual índice o site usa e para quê, logo na primeira tela."""
+    idx = carregar_ipca_incc()
+    if not idx:
+        return
+    st.info(
+        f"**Índice usado em todo o site: IPCA+INCC.** É a média, mês a mês, de dois índices "
+        "oficiais publicados pelo Banco Central: o **IPCA** (inflação oficial ao consumidor, do IBGE; "
+        "série SGS 433) e o **INCC** (Índice Nacional de Custo da Construção, da FGV; série SGS 192), "
+        "com peso de 50% cada. Ideia: o terreno acompanha a inflação, e a construção acompanha o custo "
+        f"de construir. De {mes_ano(idx['inicio'])} a {mes_ano(idx['fim'])}, ele subiu em média "
+        f"**{pct(idx['media_anual_pct']).lstrip('+')} ao ano**.\n\n"
+        "Ele é usado para: (1) levar os preços dos anúncios ao mês da última coleta "
+        f"({mes_ano(proj_art['ultimo_mes'])}); (2) simular quanto cada imóvel valia de 2016 a 2025; "
+        "(3) servir de base para a valorização futura. Em \"Comparar com\", na barra lateral, dá para "
+        "ver outros índices (IPCA sozinho, IVG-R) apenas como linha de comparação no gráfico.",
+        icon="📈",
     )
 
 
@@ -482,28 +547,27 @@ def main():
         "e não substituem uma avaliação profissional do imóvel."
     )
 
-    price_art, proj_art, faltando = carregar_modelos()
+    art, proj_art, faltando = carregar_modelos()
     if faltando:
         st.error(
             "Modelos não encontrados: "
             + ", ".join(faltando)
             + ". Treine antes com:\n\n"
-            "`python scripts_predict/imoveis_ml_hibrido.py train-hibrido`\n\n"
+            "`python scripts_predict/modelo_v3.py`\n\n"
             "`python scripts_predict/imoveis_projecao.py train-projecao`"
         )
         return
 
-    aba1, aba2, aba3, aba4 = st.tabs(
-        ["Estimativa", "Valorização por bairro", "Sobre os modelos", "Modo avançado"]
-    )
+    explicar_indice(proj_art)
+    aba1, aba2, aba3, aba4 = st.tabs(["Estimativa", "Valorização por bairro", "Modelos", "Dataset"])
     with aba1:
-        tela_estimativa(price_art, proj_art)
+        tela_estimativa(art, proj_art)
     with aba2:
         tela_bairros(proj_art)
     with aba3:
-        tela_modelos(price_art, proj_art)
+        tela_modelos()
     with aba4:
-        tela_avancada()
+        tela_dataset()
 
 
 main()
